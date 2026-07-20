@@ -1,0 +1,65 @@
+# ─── Python ───────────────────────────────────────────────
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+
+# ─── Environment & Secrets ────────────────────────────────
+.env
+.env.*
+!.env.example
+lab/.env
+
+# ─── Data files (too large for git) ──────────────────────
+lab/data/botsv3_data_set/
+lab/data/botsv3_data.tar.gz
+lab/data/enterprise-attack.json
+lab/data/bots_events.json
+
+# Keep the sample and the botsv3 README in git
+!lab/data/sample_alerts.json
+!lab/data/botsv3/
+
+# ─── Docker volumes ───────────────────────────────────────
+volumes/
+docker-volumes/
+
+# ─── IDE & OS ─────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ─── Jupyter ──────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ─── Logs & temp ──────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+
+# ─── Model weights (never commit these) ───────────────────
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.onnx
+*.gguf
+*.ggml
+
+# ─── Test & coverage artifacts ────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/

@@ -1,0 +1,14 @@
+# Architecture Justification — 6 Components × (Chosen, Alternative, Reason)
+
+| Component | Chosen | Alternative Considered | Reason (grounded in the literature) |
+|---|---|---|---|
+| **Orchestration** | LangGraph | Plain LangChain sequential chain | LanG demonstrates a working five-node StateGraph with `interrupt()`-based HIL gates in production-adjacent code; a linear chain cannot represent the conditional routing (benign → terminate; malicious → continue) both LanG and the Microsoft two-layer model require. |
+| **Inference serving** | vLLM | Ollama | LanG's own Ollama-based deployment is explicitly single-node/local; a triage agent making 5–10 tool calls per investigation at low latency needs PagedAttention-style batched throughput that Ollama is not designed to provide at that concurrency. |
+| **Asset / blast-radius store** | Neo4j | Relational UICR-style store (à la LanG) | Both LanG's stated limitation (no asset graph) and OCR-APT's central finding (graph representation is what makes causal root-cause reasoning tractable) point to the same gap; Neo4j's variable-depth Cypher traversal directly answers "what can the attacker reach in ≤3 hops," which a flat table cannot do efficiently. |
+| **Log/search tool** | OpenSearch | No dedicated search tool (rely on LLM context only) | RAM's ablation shows contextual enrichment (retrieving information about an alert's indicators) is the single largest driver of ATT&CK-mapping accuracy (AP 0.39 → 0.52); a full-text log search tool is what makes that enrichment step possible inside a closed, air-gapped SOC — replacing RAM's own open-web search agent, which is unsuitable for enterprise deployment. |
+| **Past-incident retrieval** | Qdrant vector store | No retrieval — rely on LLM parametric knowledge | The MDPI survey identifies RAG as the field's leading mitigation for hallucinated outputs; OCR-APT's own report pipeline likewise depends on a vector store for validated, per-subgraph context retrieval before final report synthesis. |
+| **ATT&CK tagging** | RAM's 6-step prompt-chaining pipeline | Direct LLM classification (single prompt) | RAM shows this pipeline beats zero-shot LLM classification (AR 0.75 vs. 0.46) precisely because the full ATT&CK technique space does not fit usefully in a single prompt without retrieval and staged refinement. |
+
+## Governance decisions (held constant across every component above)
+- **HIL placement:** only before high-impact/destructive tool calls (block IP, isolate host), never before read-only investigation steps — following the Microsoft disruption/reasoning split and LanG's two-gate pattern.
+- **Deterministic checks stay outside the LLM graph:** known-benign hash allow-lists, IP reputation thresholds, and similar policy-bound rules are enforced *before* the agent reasons, mirroring Microsoft's disruption-layer / reasoning-layer separation — not implemented as another LLM-callable tool.

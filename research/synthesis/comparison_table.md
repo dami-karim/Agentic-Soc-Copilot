@@ -1,0 +1,13 @@
+# Comparison Table — 5 Systems × 7 Attributes
+
+| Attribute | Microsoft Agentic SOC | LanG | OCR-APT | RAM | MDPI Survey (synthesis, not a system) |
+|---|---|---|---|---|---|
+| **Tool-calling / dynamic action selection** | Yes (task agents, undisclosed method) | Yes — LangGraph 5-node pipeline, tools via MCP | No — detector + LLM report writer, no tool-calling loop | Yes — ReAct agents for web search + ATT&CK retrieval | Surveys tool-calling as a general pattern across 105 systems |
+| **Human-in-the-loop (HIL) placement** | Analysts supervise; exact gate placement undisclosed | 2 mandatory gates: after Classify, after Propose Rules | None — fully automated detection + report generation | None — fully automated mapping pipeline | Identifies HITL/HoTL/HoOTL as a spectrum across surveyed systems |
+| **ATT&CK grounding** | Not disclosed in the blog post | Kill-chain mapping via UICR correlation engine (not full technique-level RAM-style tagging) | Maps anomalous subgraphs to APT kill-chain stages, not formal ATT&CK technique IDs | Core contribution — full technique/sub-technique mapping (AR 0.75, AP 0.52) | Notes ATT&CK grounding as inconsistent across the 105 surveyed systems |
+| **Provenance / graph-based reasoning** | Not disclosed | No — flat/relational UICR store | Core contribution — RDF provenance graph + GNN anomaly detection | No | Not a system-level attribute in the survey's taxonomy |
+| **Dataset used** | None released (production telemetry only) | Custom-curated rule corpora; own detection benchmarks | DARPA TC3, DARPA OpTC, simulated NODLINK | Splunk Security Content (360 endpoint rules) | 105 heterogeneous datasets across surveyed papers (no shared benchmark) |
+| **Evaluation metric** | Undisclosed method; qualitative production figures only | F1 (correlation 87%, guardrails 98.1%, kill-chain 87.5%) | F1 (avg. 0.96 across 3 datasets) | AR/AP, Weighted AR/AP, F1 (0.62 best) | Heterogeneous — F1, precision/recall, BERTScore, MTTR, case-study scores |
+| **Open-source / reproducible** | No | Yes (open-source, fully local via Ollama) | Yes (code + data on GitHub) | Yes (methodology public; uses Splunk's public dataset) | N/A (literature review, not a system) |
+
+**Note:** This table intentionally leaves a row for "this project" blank — fill it in once the architecture is finalized (Part 4/Section 4 of the SotA note), so the comparison shows exactly where the contribution sits relative to all five.
