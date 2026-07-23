@@ -22,13 +22,21 @@ class AttackStixTool(AttackCorpusTool):
         ]
 
     def query_techniques(self, data_component: str, top_k: int = 11) -> list[dict]:
-        q = data_component.lower()
+        # Split into individual keywords — match any of them
+        # Filters out short words (len <= 2) like "on", "in", "to"
+        keywords = [w.lower() for w in data_component.split() if len(w) > 2]
+
         scored = []
         for t in self.techniques:
             name = t.get("name", "").lower()
             desc = t.get("description", "").lower()
-            score = (q in name) * 2 + (q in desc)
-            if score > 0:
+
+            # Name match scores 2 per keyword, description match scores 1
+            name_score = sum(2 for kw in keywords if kw in name)
+            desc_score = sum(1 for kw in keywords if kw in desc)
+            total_score = name_score + desc_score
+
+            if total_score > 0:
                 ext_id = next(
                     (r["external_id"] for r in t.get("external_references", [])
                      if r.get("source_name") == "mitre-attack"),
@@ -38,7 +46,8 @@ class AttackStixTool(AttackCorpusTool):
                     "technique_id": ext_id,
                     "technique_name": t["name"],
                     "description": t.get("description", "")[:200],
-                    "score": score,
+                    "score": total_score,
                 })
+
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:top_k]

@@ -1,9 +1,10 @@
+import os
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct
 from sentence_transformers import SentenceTransformer
 from src.tools.interfaces import VectorRetrievalTool
 import uuid
-import os
+
 
 COLLECTION = "past_incidents"
 
