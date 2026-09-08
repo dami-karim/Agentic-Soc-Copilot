@@ -21,6 +21,7 @@ dependencies = [
     "numpy>=1.26.0",
     "tiktoken>=0.7.0",
     "transformers>=4.44.0",      # Still useful for sentence-transformers (embeddings)
+    "sentence-transformers>=3.1.0",  # Embeddings for Qdrant vector search
     "torch>=2.3.0",              # Still needed for embedding models, but will run on CPU
     "httpx>=0.27.0",
     "tenacity>=8.5.0",

@@ -1,0 +1,13 @@
+{
+  "host": "WIN-WS50",
+  "EventCode": "4634",
+  "src_ip": "10.0.8.1",
+  "dest_ip": "10.0.0.50",
+  "user": "regular_user",
+  "Logon_Type": "11",
+  "sourcetype": "WinEventLog:Security",
+  "signature": "An account was successfully logged off",
+  "severity": "low",
+  "count": 1,
+  "_time": "2026-09-02T17:45:00Z"
+}

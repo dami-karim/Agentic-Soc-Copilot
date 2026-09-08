@@ -1,0 +1,13 @@
+{
+  "host": "WIN-APP03",
+  "EventCode": "4688",
+  "src_ip": "10.0.1.33",
+  "dest_ip": "10.0.0.3",
+  "user": "devteam",
+  "Logon_Type": "2",
+  "sourcetype": "WinEventLog:Security",
+  "signature": "A new process has been created — powershell.exe with encoded command",
+  "severity": "high",
+  "count": 8,
+  "_time": "2026-09-02T14:22:30Z"
+}

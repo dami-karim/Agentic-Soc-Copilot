@@ -1,0 +1,13 @@
+{
+  "host": "WIN-DC01",
+  "EventCode": "4625",
+  "src_ip": "192.168.1.55",
+  "dest_ip": "10.0.0.10",
+  "user": "administrator",
+  "Logon_Type": "3",
+  "sourcetype": "WinEventLog:Security",
+  "signature": "An account failed to log on — multiple failures from same source",
+  "severity": "high",
+  "count": 142,
+  "_time": "2026-09-02T10:15:00Z"
+}

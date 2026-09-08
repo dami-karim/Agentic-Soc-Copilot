@@ -9,7 +9,7 @@ class Neo4jGraphTool(GraphQueryTool):
             os.getenv("NEO4J_URI", "bolt://localhost:7687"),
             auth=(
                 os.getenv("NEO4J_USER", "neo4j"),
-                os.getenv("NEO4J_PASSWORD", "damdam@1234")
+                os.getenv("NEO4J_PASSWORD")
             )
         )
 

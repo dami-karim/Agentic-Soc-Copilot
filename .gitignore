@@ -27,6 +27,11 @@ lab/data/bots_events.json
 !lab/data/sample_alerts.json
 !lab/data/botsv3/
 
+# Generated/dataset files
+lab/data/fp_batch.jsonl
+lab/data/fp_batch_labels.jsonl
+report/fp_report.json
+
 # ─── Docker volumes ───────────────────────────────────────
 volumes/
 docker-volumes/

@@ -11,12 +11,19 @@ so every docstring must clearly explain:
   - What the tool does
   - What each argument means
   - What the tool returns
+
+Week 6: Each tool now has TWO layers of protection before execution:
+  1. Schema validation (validate_tool_args) — checks types, lengths, ranges
+  2. Content safety (check_content) — blocks injection, XSS, destructive cmds
 """
+from datetime import datetime, timezone
 from langchain_core.tools import tool
 from src.tools.opensearch_tool import OpenSearchLogTool
 from src.tools.neo4j_tool import Neo4jGraphTool
 from src.tools.qdrant_tool import QdrantIncidentTool
 from src.tools.attack_corpus_tool import AttackStixTool
+from src.guardrails.guardrail_wrapper import check_content
+from src.guardrails.validators import validate_tool_args, ValidationResult
 
 # Instantiate each tool class ONCE at module level.
 # This avoids reconnecting to the database on every single tool call,
@@ -25,6 +32,38 @@ _log_tool = OpenSearchLogTool()
 _graph_tool = Neo4jGraphTool()
 _incident_tool = QdrantIncidentTool()
 _attack_tool = AttackStixTool()
+
+# Module-level accumulator for guardrail violations detected during tool execution.
+# The ReAct agent's tools don't have access to SOCAgentState, so we collect flags
+# here and merge them into state in investigate_node after the agent finishes.
+_guardrail_log: list[dict] = []
+
+
+def get_guardrail_log() -> list[dict]:
+    """Return accumulated guardrail flags from tool calls, then clear the log."""
+    global _guardrail_log
+    flags = _guardrail_log
+    _guardrail_log = []
+    return flags
+
+
+def _log_guardrail_flag(tool_name: str, arg_name: str, value: str,
+                        result: ValidationResult | None = None,
+                        check_result=None):
+    """Helper to log a guardrail flag."""
+    if result is None:
+        return  # No flag to log
+
+    _guardrail_log.append({
+        "node": tool_name,
+        "check_type": "tool_argument",
+        "argument": arg_name,
+        "value": str(value)[:200],
+        "level": check_result.level if check_result else "warn",
+        "reason": result.reason,
+        "pattern_matched": check_result.pattern_matched if check_result else None,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
 
 
 @tool
@@ -44,7 +83,22 @@ def search_logs(query: str) -> str:
         A list of matching log event dictionaries, or an error message string
         if the search fails (e.g. OpenSearch is not running).
     """
-    results = _log_tool.search(query, time_range=("now-30d", "now"))
+    # GUARDRAIL 1: Schema validation (type, length)
+    schema_results = validate_tool_args("search_logs", {"query": query})
+    for arg_name, result in schema_results.items():
+        if not result.valid:
+            _log_guardrail_flag("search_logs", arg_name, query, result)
+            return f"BLOCKED by schema validation: {result.reason}"
+
+    # GUARDRAIL 2: Content safety (injection, XSS, destructive cmds)
+    safety_result = check_content(query, node_name="search_logs:query")
+    if not safety_result.passed:
+        _log_guardrail_flag("search_logs", "query", query, safety_result)
+        return f"BLOCKED by guardrail: {safety_result.reason}"
+
+    # Use sanitized value if schema validation truncated it
+    validated_query = schema_results["query"].sanitized_value
+    results = _log_tool.search(validated_query, time_range=("now-30d", "now"))
     return str(results)
 
 
@@ -68,8 +122,25 @@ def query_blast_radius(host_id: str, max_hops: int = 3) -> str:
         A dictionary with keys: start_node, max_hops, reachable_assets (list of
         dicts with id, labels, hops), and reachable_count.
     """
-    result = _graph_tool.blast_radius(host_id, max_hops)
-    return str(result)
+    # GUARDRAIL 1: Schema validation
+    schema_results = validate_tool_args("query_blast_radius", {
+        "start_node_id": host_id, "max_hops": max_hops
+    })
+    for arg_name, result in schema_results.items():
+        if not result.valid:
+            _log_guardrail_flag("query_blast_radius", arg_name, str(locals()[arg_name]), result)
+            return f"BLOCKED by schema validation: {result.reason}"
+
+    # GUARDRAIL 2: Content safety
+    safety_result = check_content(host_id, node_name="query_blast_radius:host_id")
+    if not safety_result.passed:
+        _log_guardrail_flag("query_blast_radius", "host_id", host_id, safety_result)
+        return f"BLOCKED by guardrail: {safety_result.reason}"
+
+    validated_host_id = schema_results["start_node_id"].sanitized_value
+    validated_max_hops = schema_results["max_hops"].sanitized_value if "max_hops" in schema_results else max_hops
+    result_data = _graph_tool.blast_radius(validated_host_id, validated_max_hops)
+    return str(result_data)
 
 
 @tool
@@ -91,7 +162,21 @@ def search_similar_incidents(description: str) -> str:
         A list of similar incident dictionaries, each containing a similarity
         score, incident_id, technique, and resolution.
     """
-    results = _incident_tool.similar_incidents(description, top_k=3)
+    # GUARDRAIL 1: Schema validation
+    schema_results = validate_tool_args("search_similar_incidents", {"query_text": description})
+    for arg_name, result in schema_results.items():
+        if not result.valid:
+            _log_guardrail_flag("search_similar_incidents", arg_name, description, result)
+            return f"BLOCKED by schema validation: {result.reason}"
+
+    # GUARDRAIL 2: Content safety
+    safety_result = check_content(description, node_name="search_similar_incidents:description")
+    if not safety_result.passed:
+        _log_guardrail_flag("search_similar_incidents", "description", description, safety_result)
+        return f"BLOCKED by guardrail: {safety_result.reason}"
+
+    validated_desc = schema_results["query_text"].sanitized_value
+    results = _incident_tool.similar_incidents(validated_desc, top_k=3)
     return str(results)
 
 
@@ -115,57 +200,19 @@ def search_attack_techniques(keywords: str) -> str:
         technique_id (e.g. "T1110"), technique_name, description (first 200
         chars), and a relevance score. Results are sorted by score descending.
     """
-    results = _attack_tool.query_techniques(keywords, top_k=5)
+    # GUARDRAIL 1: Schema validation
+    schema_results = validate_tool_args("search_attack_techniques", {"data_component": keywords})
+    for arg_name, result in schema_results.items():
+        if not result.valid:
+            _log_guardrail_flag("search_attack_techniques", arg_name, keywords, result)
+            return f"BLOCKED by schema validation: {result.reason}"
+
+    # GUARDRAIL 2: Content safety
+    safety_result = check_content(keywords, node_name="search_attack_techniques:keywords")
+    if not safety_result.passed:
+        _log_guardrail_flag("search_attack_techniques", "keywords", keywords, safety_result)
+        return f"BLOCKED by guardrail: {safety_result.reason}"
+
+    validated_keywords = schema_results["data_component"].sanitized_value
+    results = _attack_tool.query_techniques(validated_keywords, top_k=5)
     return str(results)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# WHAT WAS DONE HERE — Teaching Notes
-# ──────────────────────────────────────────────────────────────────────────────
-#
-# WHY WE NEED THIS FILE:
-# ────────────────────────
-# The original tool classes (OpenSearchLogTool, Neo4jGraphTool, etc.) are
-# plain Python classes with abstract base classes (ABCs). They work fine for
-# calling from code, but an LLM cannot "see" or "call" a Python class method.
-# To let the LLM dynamically choose and invoke tools during a ReAct loop,
-# we need to wrap them as LangChain "tools".
-#
-# WHAT IS A LANGCHAIN @tool?
-# ──────────────────────────
-# When you decorate a function with @tool, LangChain:
-#   1. Extracts the function name → becomes the tool name the LLM sees
-#   2. Extracts the docstring → becomes the tool description the LLM reads
-#   3. Inspects the type hints → builds a JSON schema for the arguments
-#   4. Makes it callable by the LLM via a standard tool_call mechanism
-#
-# The LLM receives a list of available tools with their names and descriptions.
-# When it decides to use a tool, it emits a tool_call with the tool name and
-# a JSON object of arguments. LangGraph's ToolNode then executes the actual
-# Python function and feeds the result back to the LLM as a ToolMessage.
-#
-# WHY MODULE-LEVEL INSTANCES?
-# ──────────────────────────
-# We create _log_tool, _graph_tool, etc. ONCE when the module is imported,
-# not inside each function. This means:
-#   - The OpenSearch/Neo4j/Qdrant connections are opened once and reused
-#   - The ATT&CK STIX data is loaded from disk once (it's ~10MB JSON)
-#   - No cold-start penalty on every tool call
-#   - In a ReAct loop that might call 5-10 tools, this matters a LOT
-#
-# WHAT THE LLM SEES VS WHAT ACTUALLY HAPPENS:
-# ───────────────────────────────────────────
-# The LLM sees:
-#   - Tool name: "search_logs"
-#   - Description: "Search the OpenSearch SIEM log store..."
-#   - Arguments: {"query": {"type": "string", "description": "..."}}
-#
-# What actually happens when the LLM calls search_logs("10.0.2.15"):
-#   1. LangGraph's ToolNode receives the tool_call
-#   2. It looks up "search_logs" in the tools list
-#   3. It calls search_logs.invoke({"query": "10.0.2.15"})
-#   4. Inside the function, _log_tool.search("10.0.2.15") runs
-#   5. The result string is returned as a ToolMessage to the LLM
-#   6. The LLM reads the result and decides its next action
-#
-# ──────────────────────────────────────────────────────────────────────────────

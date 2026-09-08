@@ -25,6 +25,11 @@ from src.tools.langchain_tools import (
     search_similar_incidents,
     search_attack_techniques,
 )
+try:
+    from src.llm.langchain_attack_mapper import classify_attack_techniques
+    _HAS_LLM_MAPPER = True
+except Exception:
+    _HAS_LLM_MAPPER = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -70,6 +75,8 @@ TOOLS = [
     search_similar_incidents,
     search_attack_techniques,
 ]
+if _HAS_LLM_MAPPER:
+    TOOLS.append(classify_attack_techniques)
 
 
 def build_investigation_agent():
@@ -129,13 +136,29 @@ def parse_investigation_output(messages: list) -> dict:
     results = {
         "ioc_list": [],
         "attack_techniques": [],
-        "enrichment": {},
+        "enrichment": {
+            # Ordered record of every tool invocation made by the ReAct agent.
+            # Presentation-only data: consumed by the UI "Agent Execution" view
+            # to render the execution trace. Does not affect pipeline logic.
+            "tool_trace": [],
+        },
         "blast_radius": {},
         "summary_text": "",
     }
 
     for msg in messages:
         msg_type = type(msg).__name__
+
+        # Record AI tool-call requests into the trace (args only; the result
+        # is attached when the matching ToolMessage arrives).
+        if msg_type == "AIMessage" and getattr(msg, "tool_calls", None):
+            for tc in msg.tool_calls:
+                results["enrichment"]["tool_trace"].append({
+                    "step": len(results["enrichment"]["tool_trace"]) + 1,
+                    "tool": tc.get("name", "unknown"),
+                    "args": tc.get("args", {}) if isinstance(tc.get("args", {}), dict) else {"input": str(tc.get("args"))},
+                    "output": None,
+                })
 
         # Process tool results — these contain the raw data from each tool
         if msg_type == "ToolMessage":
@@ -145,6 +168,12 @@ def parse_investigation_output(messages: list) -> dict:
                 tool_name = msg.name
             elif hasattr(msg, "tool_call_id"):
                 tool_name = msg.tool_call_id
+
+            # Attach the result to the most recent matching pending trace entry
+            for entry in reversed(results["enrichment"]["tool_trace"]):
+                if entry["tool"] == tool_name and entry["output"] is None:
+                    entry["output"] = str(tool_content)
+                    break
 
             # Parse based on which tool was called
             if "search_logs" in str(tool_name):
@@ -169,6 +198,12 @@ def parse_investigation_output(messages: list) -> dict:
             # The last AIMessage (without tool_calls) is the final answer
             if not getattr(msg, "tool_calls", None):
                 results["summary_text"] = ai_content
+                results["enrichment"]["tool_trace"].append({
+                    "step": len(results["enrichment"]["tool_trace"]) + 1,
+                    "tool": "_final_answer",
+                    "args": {},
+                    "output": str(ai_content),
+                })
 
     return results
 

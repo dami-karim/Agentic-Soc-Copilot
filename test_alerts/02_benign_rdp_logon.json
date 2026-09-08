@@ -1,0 +1,13 @@
+{
+  "host": "WIN-WEB04",
+  "EventCode": "4624",
+  "src_ip": "10.0.5.22",
+  "dest_ip": "10.0.0.40",
+  "user": "jsmith",
+  "Logon_Type": "10",
+  "sourcetype": "WinEventLog:Security",
+  "signature": "An account was successfully logged on — remote interactive",
+  "severity": "low",
+  "count": 1,
+  "_time": "2026-09-02T09:00:00Z"
+}

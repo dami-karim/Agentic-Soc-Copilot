@@ -1,0 +1,13 @@
+{
+  "host": "WIN-PROXY01",
+  "EventCode": "4688",
+  "src_ip": "10.0.4.8",
+  "dest_ip": "10.0.0.4",
+  "user": "intern_alice",
+  "Logon_Type": "2",
+  "sourcetype": "WinEventLog:Security",
+  "signature": "A new process has been created — unknown binary executed by intern account",
+  "severity": "low",
+  "count": 4,
+  "_time": "2026-09-02T13:55:20Z"
+}

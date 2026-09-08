@@ -8,42 +8,38 @@ executable pipeline. It defines:
   - The conditional routing (benign → early exit, malicious → full pipeline)
   - The entry point
 
-NEW TOPOLOGY (Week 3 — ReAct upgrade):
-  ingest → classify → [conditional]
-    ├─ benign (< 30) → deploy (COMPLETED_BENIGN)
-    └─ malicious (≥ 30) → investigate (ReAct loop)
-                           → extract_results (state bridge)
-                           → rca_generator (structured RCA)
-                           → propose_actions (containment proposals)
-                           → deploy (COMPLETED)
+Week 6 UPDATED TOPOLOGY (guardrails + HIL checkpoints integrated):
+   ingest → classify → [conditional]
+                         ├── score < (threshold - margin) → deploy (COMPLETED_BENIGN)
+                         ├── score in borderline range → hil_classify → [interrupt] → investigate OR deploy (ABORTED)
+                         └── score >= threshold → investigate (ReAct loop with guardrails)
+                                                        → rca_generator
+                                                        → propose_actions
+                                                        → [conditional: high-risk?] → hil_action → [interrupt] → deploy (COMPLETED)
 
 The "investigate" node is a compiled ReAct sub-graph that dynamically
-calls tools (log search, blast radius, similar incidents, ATT&CK mapping).
-The "extract_results" node translates the ReAct agent's output back into
-the main SOCAgentState.
+calls tools (search_logs, query_blast_radius, search_similar_incidents,
+search_attack_techniques) with guardrail validation on each tool argument.
+The "extract_results" translation is handled inside investigate_node itself.
 """
 from langgraph.graph import StateGraph, END
-from src.state import SOCAgentState, Phase
+from langgraph.types import interrupt, Command
+from src.state import SOCAgentState, Phase, FinalStatus
 from src.nodes.ingest import ingest_node
-from src.nodes.classify import classify_node
+from src.nodes.classify import classify_node, BENIGN_THRESHOLD
 from src.nodes.deploy import deploy_node
 from src.nodes.rca_generator import rca_generator_node
 from src.nodes.propose_actions import propose_actions_node
+from src.guardrails.hil_checkpoint import requires_hil
 from src.react_graph import build_investigation_agent, parse_investigation_output
+from src.guardrails.guardrail_wrapper import check_content
+from src.tools.langchain_tools import get_guardrail_log
 from datetime import datetime, timezone
 
-BENIGN_THRESHOLD = 30.0
-
-
-def route_after_classify(state: SOCAgentState) -> str:
-    """
-    Conditional edge after classify_node.
-    Routes benign alerts directly to deploy (terminate early).
-    Routes suspicious alerts through the full ReAct investigation pipeline.
-    """
-    if state["triage_score"] < BENIGN_THRESHOLD:
-        return "deploy"
-    return "investigate"
+# Borderline threshold: alerts within this range of the benign threshold
+# trigger the first HIL gate. E.g. if BENIGN_THRESHOLD=30 and BORDERLINE_MARGIN=10,
+# alerts scoring 20-29 go through the classification review gate.
+BORDERLINE_MARGIN = 5.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -55,10 +51,42 @@ def route_after_classify(state: SOCAgentState) -> str:
 #
 # Why module level? Because building the agent involves:
 #   1. Loading the ChatOllama model connection
-#   2. Registering the 4 tools
+#   2. Registering the 4 tools (now with guardrail validation)
 #   3. Compiling the LangGraph state machine
 # Doing this on every alert would add ~2-3 seconds of overhead per investigation.
 _investigation_agent = build_investigation_agent()
+
+
+def route_after_classify(state: SOCAgentState) -> str:
+    """
+    Conditional edge after classify_node.
+
+    Three routes:
+    - score < (BENIGN_THRESHOLD - BORDERLINE_MARGIN) → "deploy" (clearly benign, no HIL)
+    - score in borderline range → "hil_classify" (analyst review before investigation)
+    - score >= BENIGN_THRESHOLD → "investigate" (full ReAct investigation, read-only so no HIL gate needed)
+    """
+    score = state["triage_score"]
+    borderline_low = BENIGN_THRESHOLD - BORDERLINE_MARGIN
+
+    if score < borderline_low:
+        return "deploy"
+    elif score < BENIGN_THRESHOLD:
+        return "hil_classify"
+    else:
+        return "investigate"
+
+
+def route_after_propose_actions(state: SOCAgentState) -> str:
+    """
+    After proposing actions, check if any are high-risk.
+    If so, route to the HIL checkpoint. Otherwise, go straight to deploy.
+    """
+    proposals = state.get("proposed_actions", [])
+    high_risk = [a for a in proposals if requires_hil(a)]
+    if high_risk:
+        return "hil_action"
+    return "deploy"
 
 
 def investigate_node(state: SOCAgentState) -> SOCAgentState:
@@ -67,9 +95,10 @@ def investigate_node(state: SOCAgentState) -> SOCAgentState:
 
     This node:
       1. Builds a human-readable alert description from state["alert_raw"]
-      2. Invokes the ReAct agent (which dynamically calls tools)
+      2. Invokes the ReAct agent (which dynamically calls tools with guardrail validation)
       3. Parses the agent's output to extract structured findings
-      4. Writes the findings back into SOCAgentState
+      4. Post-validates the LLM output via guardrails before writing to state
+      5. Collects any guardrail flags from tool calls and writes them to state
 
     The ReAct agent uses its own internal MessagesState, so this node
     acts as the BRIDGE between the agent's state and the main graph's state.
@@ -94,7 +123,6 @@ def investigate_node(state: SOCAgentState) -> SOCAgentState:
     )
 
     # Invoke the ReAct agent
-    # The agent returns a dict with "messages" (the full conversation)
     try:
         agent_result = _investigation_agent.invoke({
             "messages": [{"role": "user", "content": investigation_prompt}]
@@ -109,9 +137,36 @@ def investigate_node(state: SOCAgentState) -> SOCAgentState:
         })
         return state
 
+    # Collect guardrail flags from tool calls during the ReAct loop
+    tool_guardrail_flags = get_guardrail_log()
+    for flag in tool_guardrail_flags:
+        state["guardrail_flags"].append(flag)
+
     # Parse the agent's output messages to extract structured findings
     messages = agent_result.get("messages", [])
     findings = parse_investigation_output(messages)
+
+    # GUARDRAIL: Post-validate the LLM's final output (summary text)
+    summary_text = findings.get("summary_text", "")
+    if summary_text:
+        output_result = check_content(summary_text, node_name="investigate:llm_output")
+        if output_result.level != "pass":
+            state["guardrail_flags"].append({
+                "node": "investigate",
+                "check_type": "output",
+                "level": output_result.level,
+                "reason": output_result.reason,
+                "pattern_matched": output_result.pattern_matched,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+            if not output_result.passed:
+                # If the LLM output is blocked, use a safe fallback summary
+                summary_text = (
+                    f"Investigation output was blocked by guardrails. "
+                    f"Raw alert: EventCode={alert.get('EventCode', 'unknown')} "
+                    f"host={alert.get('host', 'unknown')}."
+                )
+                findings["summary_text"] = summary_text
 
     # Write findings back into SOCAgentState
     # IoCs — merge agent-extracted IoCs with any we already have
@@ -132,6 +187,13 @@ def investigate_node(state: SOCAgentState) -> SOCAgentState:
     if agent_blast and agent_blast.get("reachable_assets"):
         state["blast_radius"] = agent_blast
 
+    # Count guardrail flags from this investigation
+    guardrail_count = len([
+        f for f in state["guardrail_flags"]
+        if f["node"] in ("investigate", "search_logs", "query_blast_radius",
+                         "search_similar_incidents", "search_attack_techniques")
+    ])
+
     # Log the investigation summary
     summary = findings.get("summary_text", "No summary produced")
     state["event_log"].append({
@@ -142,6 +204,7 @@ def investigate_node(state: SOCAgentState) -> SOCAgentState:
             f"{len(state['ioc_list'])} IoCs, "
             f"{len(state['attack_techniques'])} techniques, "
             f"blast_radius={'yes' if state['blast_radius'] else 'no'}. "
+            f"Guardrail flags: {guardrail_count}. "
             f"Summary: {summary[:200]}"
         ),
     })
@@ -149,18 +212,173 @@ def investigate_node(state: SOCAgentState) -> SOCAgentState:
     return state
 
 
-def build_graph():
+def hil_classify_checkpoint(state: SOCAgentState) -> str | Command:
     """
-    Assembles the Week 3 LangGraph pipeline with ReAct investigation.
+    HIL Gate 1 — Classification review for borderline alerts.
 
-    Topology:
+    Pauses execution and asks the analyst to confirm whether to proceed
+    with full investigation or treat as benign.
+
+    Uses LangGraph's interrupt() to pause the graph and return control
+    to the caller, who resumes with a Command(resume=...).
+    """
+    state["phase"] = Phase.AWAITING_CLASSIFICATION_REVIEW
+
+    score = state["triage_score"]
+    alert = state["alert_raw"]
+
+    analyst_decision = interrupt({
+        "gate_name": "HIL_1_Classification_Review",
+        "message": (
+            f"Borderline alert: triage_score={score} "
+            f"(threshold={BENIGN_THRESHOLD}, borderline_range="
+            f"{BENIGN_THRESHOLD - BORDERLINE_MARGIN:.0f}-{BENIGN_THRESHOLD:.0f}). "
+            f"EventCode={alert.get('EventCode', 'unknown')} "
+            f"host={alert.get('host', 'unknown')} "
+            f"severity={state.get('severity', 'unknown')}"
+        ),
+        "score": score,
+        "triage_score": score,
+        "benign_threshold": BENIGN_THRESHOLD,
+        "alert": {
+            "host": alert.get("host", "unknown"),
+            "EventCode": alert.get("EventCode", "unknown"),
+            "src_ip": alert.get("src_ip", "unknown"),
+            "user": alert.get("user", "unknown"),
+            "severity": alert.get("severity", "unknown"),
+        },
+    })
+
+    # Record the analyst's decision in the audit trail
+    state["human_decisions"].append({
+        "gate_name": "HIL_1_Classification_Review",
+        "decision": analyst_decision.get("decision", "unknown"),
+        "analyst_id": analyst_decision.get("analyst_id", "interactive"),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "notes": analyst_decision.get("notes", ""),
+    })
+
+    if analyst_decision.get("decision") == "approved":
+        state["event_log"].append({
+            "node": "hil_classify",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "detail": "Borderline alert APPROVED by analyst — proceeding to investigation.",
+        })
+        return Command(resume=analyst_decision, goto="investigate")
+    else:
+        state["final_status"] = FinalStatus.ABORTED
+        state["event_log"].append({
+            "node": "hil_classify",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "detail": "Borderline alert REJECTED by analyst — terminated as benign.",
+        })
+        return Command(resume=analyst_decision, goto="deploy")
+
+
+def hil_action_checkpoint(state: SOCAgentState) -> str | Command:
+    """
+    HIL Gate 2 — Action approval for high-risk containment actions.
+
+    Pauses execution and presents high-risk actions to the analyst for approval.
+    Uses LangGraph's interrupt() for proper graph pausing.
+    """
+    state["phase"] = Phase.AWAITING_ACTION_REVIEW
+
+    proposed = state["proposed_actions"]
+    if not proposed:
+        state["event_log"].append({
+            "node": "hil_action",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "detail": "No proposed actions — HIL gate skipped",
+        })
+        return state
+
+    high_risk_actions = [a for a in proposed if requires_hil(a)]
+    if not high_risk_actions:
+        state["event_log"].append({
+            "node": "hil_action",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "detail": "No high-risk actions — HIL gate skipped",
+        })
+        return state
+
+    # Pause for analyst approval via interrupt()
+    analyst_decisions = interrupt({
+        "gate_name": "HIL_2_Action_Approval",
+        "message": f"High-risk actions require analyst approval ({len(high_risk_actions)} action(s)).",
+        "high_risk_actions": high_risk_actions,
+        "confidence": state.get("rca_report", {}).get("overall_confidence", 0),
+    })
+
+    approved_actions = []
+    rejected_actions = []
+
+    # Process the analyst's decisions
+    for action in high_risk_actions:
+        action_key = f"{action['action_type']}:{action['target']}"
+        decision_entry = next(
+            (d for d in analyst_decisions.get("decisions", [])
+             if d.get("action_key") == action_key),
+            None
+        )
+
+        if decision_entry and decision_entry.get("decision") == "approved":
+            approved_actions.append(action)
+        else:
+            rejected_actions.append(action)
+
+        # Record in audit trail
+        state["human_decisions"].append({
+            "gate_name": "HIL_2_Action_Approval",
+            "action_type": action["action_type"],
+            "target": action["target"],
+            "risk_level": action["risk_level"],
+            "decision": decision_entry.get("decision", "rejected") if decision_entry else "rejected",
+            "analyst_note": decision_entry.get("notes", "") if decision_entry else "",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+    # Also keep auto-approved (low-risk) actions
+    low_risk_actions = [a for a in proposed if not requires_hil(a)]
+
+    # Update proposed_actions to only include approved + auto-approved
+    state["proposed_actions"] = low_risk_actions + approved_actions
+
+    state["event_log"].append({
+        "node": "hil_action",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "detail": (
+            f"HIL gate complete: "
+            f"{len(approved_actions)} high-risk approved, "
+            f"{len(rejected_actions)} high-risk rejected, "
+            f"{len(low_risk_actions)} low-risk auto-approved. "
+            f"Audit trail written to human_decisions."
+        ),
+    })
+
+    return Command(resume=analyst_decisions, goto="deploy")
+
+
+def build_graph(with_hil: bool = True):
+    """
+    Assembles the Week 6 LangGraph pipeline with guardrails and HIL checkpoints.
+
+    Topology (with HIL gates):
         ingest → classify → [conditional]
-            benign  → deploy (COMPLETED_BENIGN)
+            clearly benign (< threshold - margin) → deploy (COMPLETED_BENIGN)
+            borderline → hil_classify → interrupt → investigate OR deploy (ABORTED)
+            suspicious (>= threshold) → investigate → rca_generator → propose_actions → [conditional]
+                no high-risk → deploy
+                high-risk → hil_action → interrupt → deploy
+
+    Topology (without HIL gates, for testing):
+        ingest → classify → [conditional]
+            benign → deploy (COMPLETED_BENIGN)
             malicious → investigate → rca_generator → propose_actions → deploy (COMPLETED)
 
-    The "investigate" node wraps a compiled ReAct sub-graph that
-    dynamically calls tools. The "extract_results" translation is
-    handled inside investigate_node itself (see above).
+    Args:
+        with_hil: If True, include HIL checkpoint nodes in the graph.
+                  Set to False for automated testing (no interrupt pauses).
     """
     graph = StateGraph(SOCAgentState)
 
@@ -171,6 +389,10 @@ def build_graph():
     graph.add_node("rca_generator", rca_generator_node)
     graph.add_node("propose_actions", propose_actions_node)
     graph.add_node("deploy", deploy_node)
+
+    if with_hil:
+        graph.add_node("hil_classify", hil_classify_checkpoint)
+        graph.add_node("hil_action", hil_action_checkpoint)
 
     # Set the entry point
     graph.set_entry_point("ingest")
@@ -183,15 +405,32 @@ def build_graph():
         "classify",
         route_after_classify,
         {
-            "deploy": "deploy",              # Benign → early exit
-            "investigate": "investigate",    # Suspicious → full pipeline
+            "deploy": "deploy",
+            "hil_classify": "hil_classify" if with_hil else "investigate",
+            "investigate": "investigate",
         }
     )
 
     # Fixed edges for the malicious investigation path
     graph.add_edge("investigate", "rca_generator")
     graph.add_edge("rca_generator", "propose_actions")
-    graph.add_edge("propose_actions", "deploy")
+
+    if with_hil:
+        # Conditional edge after propose_actions — check for high-risk actions
+        graph.add_conditional_edges(
+            "propose_actions",
+            route_after_propose_actions,
+            {
+                "hil_action": "hil_action",
+                "deploy": "deploy",
+            }
+        )
+        # After HIL action gate, always go to deploy
+        graph.add_edge("hil_action", "deploy")
+        # After HIL classify gate, the node returns a Command with goto
+    else:
+        # Without HIL, propose_actions goes directly to deploy
+        graph.add_edge("propose_actions", "deploy")
 
     # Terminal edge
     graph.add_edge("deploy", END)
@@ -205,7 +444,7 @@ def build_graph():
 if __name__ == "__main__":
     from src.nodes.ingest import make_initial_input
 
-    app = build_graph()
+    app = build_graph(with_hil=False)
 
     # Test alert — brute force pattern (same as before)
     test_alert = {
@@ -221,7 +460,7 @@ if __name__ == "__main__":
     }
 
     print("=" * 60)
-    print("AGENTIC SOC CO-PILOT — Week 3 ReAct Pipeline")
+    print("AGENTIC SOC CO-PILOT — Week 6 Pipeline (HIL disabled for smoke test)")
     print("=" * 60)
     print(f"Alert: EventCode={test_alert['EventCode']} "
           f"host={test_alert['host']} user={test_alert['user']}")
@@ -237,6 +476,8 @@ if __name__ == "__main__":
     print(f"ATT&CK tags:     {[t['technique_id'] for t in result['attack_techniques']]}")
     print(f"Blast radius:    {bool(result['blast_radius'])}")
     print(f"Proposed actions: {len(result['proposed_actions'])}")
+    print(f"Guardrail flags:  {len(result['guardrail_flags'])}")
+    print(f"HIL decisions:    {len(result['human_decisions'])}")
     print()
 
     # Print the structured RCA report
@@ -269,120 +510,11 @@ if __name__ == "__main__":
         print(f"  [{event['node']}] {event['detail'][:120]}")
     print()
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# WHAT WAS DONE HERE — Teaching Notes
-# ──────────────────────────────────────────────────────────────────────────────
-#
-# THIS FILE WAS COMPLETELY REWRITTEN for Week 3's ReAct upgrade.
-# Here's what changed and why:
-#
-# ──────────────────────────────────────────────────────────────────────────────
-# BEFORE (original graph.py):
-# ────────────────────────────
-#   ingest → classify → [conditional]
-#       benign → deploy
-#       malicious → analyze_logs → attack_tagger → deploy
-#
-#   This was a FIXED pipeline — every alert went through the same steps
-#   in the same order. No LLM reasoning, no dynamic tool selection.
-#
-# ──────────────────────────────────────────────────────────────────────────────
-# AFTER (new graph.py):
-# ──────────────────────
-#   ingest → classify → [conditional]
-#       benign → deploy
-#       malicious → investigate (ReAct) → rca_generator → propose_actions → deploy
-#
-#   The "investigate" node wraps a ReAct agent that dynamically decides
-#   which tools to call. The RCA generator and propose_actions nodes
-#   produce structured output from the investigation findings.
-#
-# ──────────────────────────────────────────────────────────────────────────────
-# NEW NODES:
-# ───────────
-# 1. investigate_node — wraps the ReAct agent from react_graph.py
-#    - Builds an alert description prompt
-#    - Invokes the ReAct agent (which calls tools dynamically)
-#    - Parses the agent's output to extract IoCs, techniques, etc.
-#    - Writes findings back into SOCAgentState
-#
-# 2. rca_generator_node — from rca_generator.py
-#    - Takes all investigation findings
-#    - Produces a structured RCA report with:
-#      - summary (human-readable narrative)
-#      - attack_techniques (with confidence scores)
-#      - ioc_summary (with context)
-#      - overall_confidence (weighted average)
-#      - containment_actions (mapped from ATT&CK techniques)
-#      - timeline (from event_log)
-#
-# 3. propose_actions_node — from propose_actions_node.py
-#    - Takes the ATT&CK techniques and blast radius
-#    - Produces specific containment proposals:
-#      - reset_credentials, isolate_host, block_network_path, etc.
-#    - Each proposal has a risk_level (low/medium/high)
-#    - high-risk actions will require HIL gate in Week 6
-#
-# ──────────────────────────────────────────────────────────────────────────────
-# HOW THE STATE BRIDGE WORKS:
-# ───────────────────────────
-# The ReAct agent uses its own MessagesState (key = "messages").
-# The main graph uses SOCAgentState (key = all the custom fields).
-#
-# The investigate_node bridges these two:
-#   1. Extracts alert data from SOCAgentState
-#   2. Builds a prompt and invokes the ReAct agent
-#   3. Parses the agent's messages to extract structured findings
-#   4. Writes findings back into SOCAgentState fields:
-#      - ioc_list ← from log search results
-#      - attack_techniques ← from ATT&CK corpus results
-#      - enrichment ← from all tool results
-#      - blast_radius ← from Neo4j query results
-#
-# This pattern (sub-graph with state translation) is the standard way
-# to integrate LangGraph's prebuilt agents into custom pipelines.
-#
-# ──────────────────────────────────────────────────────────────────────────────
-# WHY THE BENIGN THRESHOLD IS STILL 30.0:
-# ────────────────────────────────────────
-# The classify node hasn't changed — it still uses the same rule-based
-# scoring (severity + EventCode boost). Alerts below 30 are routed
-# directly to deploy (benign path), skipping the expensive ReAct loop.
-#
-# This is intentional for Week 3: the ReAct agent uses an LLM which
-# costs compute time. We don't want to waste LLM calls on obviously
-# benign alerts. In Week 4+, the classify node could be upgraded to
-# use an LLM for more nuanced severity assessment.
-#
-# ──────────────────────────────────────────────────────────────────────────────
-# WHY THE OLD analyze_logs.py AND attack_tagger.py STILL EXIST:
-# ─────────────────────────────────────────────────────────────
-# They're NOT deleted — they still contain useful functions:
-#   - analyze_logs.py: extract_iocs() — could be used as a fallback
-#   - attack_tagger.py: build_rationale() — still used for formatting
-#
-# But they're no longer called from the main graph. The ReAct agent
-# replaces their functionality with dynamic tool calls. They remain
-# as reference code and potential fallback implementations.
-#
-# ──────────────────────────────────────────────────────────────────────────────
-# HOW TO RUN THE SMOKE TEST:
-# ──────────────────────────
-# 1. Make sure Ollama is running: docker compose up ollama
-# 2. Make sure the model is pulled: docker exec soc-ollama ollama pull llama3.2:3b
-# 3. Run: python -m src.graph
-#
-# The test will:
-#   - Ingest a brute-force test alert
-#   - Classify it as suspicious (score=60 ≥ threshold 30)
-#   - Run the ReAct investigation agent
-#   - Generate an RCA report
-#   - Propose containment actions
-#   - Print the full results
-#
-# If Ollama is not running, the investigate_node catches the exception
-# and continues with empty investigation data — you'll still see the
-# pipeline structure work, just without LLM-generated findings.
-#
-# ──────────────────────────────────────────────────────────────────────────────
+    # Print guardrail flags
+    if result["guardrail_flags"]:
+        print("─" * 60)
+        print("GUARDRAIL FLAGS")
+        print("─" * 60)
+        for flag in result["guardrail_flags"]:
+            print(f"  [{flag.get('level', 'unknown')}] {flag.get('node', '?')}: {flag.get('reason', '?')}")
+        print()

@@ -10,7 +10,7 @@ To run with the REAL ReAct agent (requires Ollama + model):
     pytest tests/test_graph.py -k "real" --runslow
 """
 from unittest.mock import patch, MagicMock
-from src.graph import build_graph, BENIGN_THRESHOLD
+from src.graph import build_graph, BENIGN_THRESHOLD, BORDERLINE_MARGIN
 from src.nodes.ingest import make_initial_input
 from src.state import Phase, FinalStatus
 
@@ -35,7 +35,7 @@ class TestBenignPath:
 
     def test_benign_alert_skips_investigation(self, benign_alert):
         """Benign alerts should go directly to deploy, NOT through investigate."""
-        app = build_graph()
+        app = build_graph(with_hil=False)
         initial = make_initial_input(benign_alert)
 
         # Track which nodes are visited by checking event_log
@@ -49,19 +49,19 @@ class TestBenignPath:
         assert "deploy" in visited_nodes
 
     def test_benign_status(self, benign_alert):
-        app = build_graph()
+        app = build_graph(with_hil=False)
         initial = make_initial_input(benign_alert)
         result = app.invoke(initial)
         assert result["final_status"] == FinalStatus.COMPLETED_BENIGN
 
     def test_benign_no_rca(self, benign_alert):
-        app = build_graph()
+        app = build_graph(with_hil=False)
         initial = make_initial_input(benign_alert)
         result = app.invoke(initial)
         assert result["rca_report"] == {}
 
     def test_benign_no_proposed_actions(self, benign_alert):
-        app = build_graph()
+        app = build_graph(with_hil=False)
         initial = make_initial_input(benign_alert)
         result = app.invoke(initial)
         assert result["proposed_actions"] == []
@@ -75,7 +75,7 @@ class TestMaliciousPath:
         """Malicious alerts must go through investigate → rca → actions → deploy."""
         mock_agent.invoke.return_value = _make_mock_agent_output()
 
-        app = build_graph()
+        app = build_graph(with_hil=False)
         initial = make_initial_input(brute_force_alert)
         result = app.invoke(initial)
 
@@ -90,14 +90,14 @@ class TestMaliciousPath:
     @patch("src.graph._investigation_agent")
     def test_malicious_status(self, mock_agent, brute_force_alert):
         mock_agent.invoke.return_value = _make_mock_agent_output()
-        app = build_graph()
+        app = build_graph(with_hil=False)
         result = app.invoke(make_initial_input(brute_force_alert))
         assert result["final_status"] == FinalStatus.COMPLETED
 
     @patch("src.graph._investigation_agent")
     def test_rca_report_generated(self, mock_agent, brute_force_alert):
         mock_agent.invoke.return_value = _make_mock_agent_output()
-        app = build_graph()
+        app = build_graph(with_hil=False)
         result = app.invoke(make_initial_input(brute_force_alert))
         assert result["rca_report"] != {}
         assert "summary" in result["rca_report"]
@@ -106,7 +106,7 @@ class TestMaliciousPath:
     @patch("src.graph._investigation_agent")
     def test_proposed_actions_generated(self, mock_agent, brute_force_alert):
         mock_agent.invoke.return_value = _make_mock_agent_output()
-        app = build_graph()
+        app = build_graph(with_hil=False)
         result = app.invoke(make_initial_input(brute_force_alert))
         assert len(result["proposed_actions"]) > 0
 
@@ -114,7 +114,7 @@ class TestMaliciousPath:
     def test_agent_invoked_with_alert(self, mock_agent, brute_force_alert):
         """The mock agent should have been called with a messages list."""
         mock_agent.invoke.return_value = _make_mock_agent_output()
-        app = build_graph()
+        app = build_graph(with_hil=False)
         app.invoke(make_initial_input(brute_force_alert))
 
         mock_agent.invoke.assert_called_once()
@@ -132,7 +132,7 @@ class TestAgentGracefulFailure:
         """If the agent raises an exception, the pipeline should continue."""
         mock_agent.invoke.side_effect = ConnectionError("Ollama not running")
 
-        app = build_graph()
+        app = build_graph(with_hil=False)
         result = app.invoke(make_initial_input(brute_force_alert))
 
         # Pipeline should still complete
@@ -143,7 +143,7 @@ class TestAgentGracefulFailure:
         """On agent failure, investigation data should be empty."""
         mock_agent.invoke.side_effect = ConnectionError("Ollama not running")
 
-        app = build_graph()
+        app = build_graph(with_hil=False)
         result = app.invoke(make_initial_input(brute_force_alert))
 
         # No IoCs or techniques from the failed investigation
@@ -155,7 +155,7 @@ class TestAgentGracefulFailure:
         """Even with empty investigation, RCA should be generated (with empty data)."""
         mock_agent.invoke.side_effect = ConnectionError("Ollama not running")
 
-        app = build_graph()
+        app = build_graph(with_hil=False)
         result = app.invoke(make_initial_input(brute_force_alert))
 
         # RCA should exist but be mostly empty
@@ -169,28 +169,28 @@ class TestStateFlow:
     @patch("src.graph._investigation_agent")
     def test_state_preserves_workflow_id(self, mock_agent, brute_force_alert):
         mock_agent.invoke.return_value = _make_mock_agent_output()
-        app = build_graph()
+        app = build_graph(with_hil=False)
         result = app.invoke(make_initial_input(brute_force_alert))
         assert result["workflow_id"] == "test-workflow-001" or result["workflow_id"] is not None
 
     @patch("src.graph._investigation_agent")
     def test_state_preserves_alert_raw(self, mock_agent, brute_force_alert):
         mock_agent.invoke.return_value = _make_mock_agent_output()
-        app = build_graph()
+        app = build_graph(with_hil=False)
         result = app.invoke(make_initial_input(brute_force_alert))
         assert result["alert_raw"] == brute_force_alert
 
     @patch("src.graph._investigation_agent")
     def test_phase_ends_at_completed(self, mock_agent, brute_force_alert):
         mock_agent.invoke.return_value = _make_mock_agent_output()
-        app = build_graph()
+        app = build_graph(with_hil=False)
         result = app.invoke(make_initial_input(brute_force_alert))
         assert result["phase"] == Phase.COMPLETED
 
     @patch("src.graph._investigation_agent")
     def test_triage_score_set_by_classify(self, mock_agent, brute_force_alert):
         mock_agent.invoke.return_value = _make_mock_agent_output()
-        app = build_graph()
+        app = build_graph(with_hil=False)
         result = app.invoke(make_initial_input(brute_force_alert))
         assert result["triage_score"] == 60.0  # medium(40) + 4625(20)
 
@@ -201,7 +201,7 @@ class TestPersistenceAlert:
     @patch("src.graph._investigation_agent")
     def test_critical_alert_runs_full_pipeline(self, mock_agent, persistence_alert):
         mock_agent.invoke.return_value = _make_mock_agent_output()
-        app = build_graph()
+        app = build_graph(with_hil=False)
         result = app.invoke(make_initial_input(persistence_alert))
         assert result["final_status"] == FinalStatus.COMPLETED
         assert result["triage_score"] == 100.0  # Capped at 100
@@ -209,6 +209,6 @@ class TestPersistenceAlert:
     @patch("src.graph._investigation_agent")
     def test_critical_alert_has_rca(self, mock_agent, persistence_alert):
         mock_agent.invoke.return_value = _make_mock_agent_output()
-        app = build_graph()
+        app = build_graph(with_hil=False)
         result = app.invoke(make_initial_input(persistence_alert))
         assert "summary" in result["rca_report"]

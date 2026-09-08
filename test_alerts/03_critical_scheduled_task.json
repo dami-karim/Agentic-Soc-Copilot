@@ -1,0 +1,13 @@
+{
+  "host": "WIN-FIN02",
+  "EventCode": "4698",
+  "src_ip": "",
+  "dest_ip": "",
+  "user": "svc_backup",
+  "Logon_Type": "",
+  "sourcetype": "WinEventLog:Security",
+  "signature": "A scheduled task was created — suspicious binary path detected",
+  "severity": "critical",
+  "count": 1,
+  "_time": "2026-09-02T03:42:11Z"
+}
